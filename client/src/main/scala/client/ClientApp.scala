@@ -15,8 +15,10 @@ class ClientProgram[F[_]: Effect: Logger] extends AppBoot[F] {
 
   override def appStream(config: ServiceConfig): fs2.Stream[F, StreamApp.ExitCode] =
     for {
-      client <- SmartHomeServiceClient.createClient(config.host.value, config.port.value)
-      _      <- Stream.eval(client.isEmpty)
+      client  <- SmartHomeServiceClient.createClient(config.host.value, config.port.value)
+      _       <- Stream.eval(client.isEmpty)
+      summary <- client.getTemperature
+      _       <- Stream.eval(Logger[F].info(s"The average temperature is: ${summary.averageTemperature}"))
     } yield StreamApp.ExitCode.Success
 }
 

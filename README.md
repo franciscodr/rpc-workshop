@@ -10,6 +10,18 @@
     - [Protocol](#protocol)
     - [Server](#server)
     - [Client](#client)
+- [Evolving the Avro schema](#evolving-the-avro-schema)
+  - [Protocol](#protocol-1)
+- [Unary RPC service: `IsEmpty`](#unary-rpc-service-isempty)
+  - [Protocol](#protocol-2)
+  - [Server](#server-1)
+  - [Client](#client-1)
+  - [Result](#result)
+- [Server-streaming RPC service: `GetTemperature`](#server-streaming-rpc-service-gettemperature)
+  - [Protocol](#protocol-3)
+  - [Server](#server-2)
+  - [Client](#client-2)
+  - [Result](#result-1)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -288,6 +300,602 @@ for {
     .eval(List("foo", "bar", "baz").traverse[F, Person](peopleClient.getPerson))
     .as(StreamApp.ExitCode.Success)
 } yield exitCode
+```
+
+## Evolving the Avro schema
+
+As we have seen before, both client and server are using the same common protocol defined via Avro schema, which is an ideal scenario but realistically speaking the server side might need to add certainly changes in the model. Then how the server can preserve the compatibility with clients that are still using the old model?
+
+Thanks to the Avro definitions we can add evolutions to the models in a safety way, keeping all the clients fully compatible but obviously, there are some limited operations that can't be done, like removing a field in a response model or adding a new required field to a request object.
+
+To illustrate that non-updated clients are able to keep interacting with evolved servers, we'll just add a new field `phone` to `Person`.
+
+### Protocol
+
+Let's add a new evolution to the models described in the protocol
+
+**_People.avdl_**
+
+
+```scala
+protocol People {
+
+  record Person {
+    string name;
+    int age;
+    string phone;
+  }
+
+  record PeopleRequest {
+    string name;
+  }
+
+  record PeopleResponse {
+    Person person;
+  }
+
+}
+```
+
+We can now run the server app using this new version, and the client app with the previous one, and the requests should have been processed properly on both sides.
+
+As we can see, the client digests `Person`s instances included in the responses as expected:
+
+```scala
+INFO  - Created new RPC client for (localhost,19683)
+INFO  - Request: foo
+INFO  - Result: PeopleResponse(Person(foo,24))
+INFO  - Request: bar
+INFO  - Result: PeopleResponse(Person(bar,9))
+INFO  - Request: baz
+INFO  - Result: PeopleResponse(Person(baz,17))
+INFO  - Removed 1 RPC clients from cache.
+```
+
+Even when actually the server is including the telephone numbers at them:
+
+```scala
+INFO  - PeopleService - Request: PeopleRequest(foo)
+INFO  - PeopleService - Sending response: Person(foo,24,(206) 198-8396)
+INFO  - PeopleService - Request: PeopleRequest(bar)
+INFO  - PeopleService - Sending response: Person(bar,9,(206) 740-2096)
+INFO  - PeopleService - Request: PeopleRequest(baz)
+INFO  - PeopleService - Sending response: Person(baz,17,(206) 812-1984)
+```
+
+## Unary RPC service: `IsEmpty`
+
+Having said this, now it's the right moment to get started to develop the features of the SmartHome, and discard the `People` stuff. As we said above, we want also to build a unary RPC service to let clients know if there is somebody in the home or there is not.
+
+### Protocol
+
+In order to show another way to define protocols, we are going to express our models and services using directly Scala code, and using **ProtocolBuffer** as serialiser instead of **Avro**.
+
+So the protocol module can adopt know this shape (of course we should also discard the `idlgens` references at `ProjectPlugin.scala` and `plugins.sbt`):
+
+```scala
+├── protocol
+│   └── src
+│       └── main
+│           └── scala
+│               └── protocol
+│                   ├── Messages.scala
+│                   └── SmartHomeService.scala
+```
+
+**_Messages.scala_**
+
+Where we defined the messages flowing through the wire:
+
+```scala
+@message
+final case class IsEmptyRequest()
+
+@message
+final case class IsEmptyResponse(result: Boolean)
+```
+
+**_SmartHomeService.scala_**
+
+Where we defined interface of the RPC service:
+
+```scala
+@service(Protobuf) trait SmartHomeService[F[_]] {
+
+  def isEmpty(request: IsEmptyRequest): F[IsEmptyResponse]
+
+}
+```
+
+### Server
+
+Now, we have to implement an interpreter for the new service `SmartHomeService`:
+
+```scala
+class SmartHomeServiceHandler[F[_]: Sync: Logger] extends SmartHomeService[F] {
+  val serviceName = "SmartHomeService"
+
+  override def isEmpty(request: IsEmptyRequest): F[IsEmptyResponse] =
+    Logger[F].info(s"$serviceName - Request: $request").as(IsEmptyResponse(true))
+
+}
+```
+
+And bind it to the gRPC server:
+
+```scala
+val grpcConfigs: List[GrpcConfig] = List(AddService(SmartHomeService.bindService[F]))
+```
+
+### Client
+
+And the client, of course, needs an algebra to describe the same operation:
+
+```scala
+trait SmartHomeServiceClient[F[_]] {
+  def isEmpty(): F[Boolean]
+}
+```
+
+That will be called when the app is running
+
+```scala
+for {
+  client <- SmartHomeServiceClient.createClient(config.host.value, config.port.value)
+  _      <- Stream.eval(client.isEmpty)
+} yield StreamApp.ExitCode.Success
+```
+
+### Result
+
+When we run the client now with `sbt runClient` we get:
+
+```bash
+INFO  - Created new RPC client for (localhost,19683)
+INFO  - Result: IsEmptyResponse(true)
+INFO  - Removed 1 RPC clients from cache.
+```
+
+And the server log the request as expected:
+
+```bash
+INFO  - SmartHomeService - Request: IsEmptyRequest()
+```
+
+## Server-streaming RPC service: `GetTemperature`
+
+Following the established plan, the next step is building the service that returns a stream of temperature values, to let clients subscribe to collect real-time info.
+
+### Protocol
+
+As usual we should add this operation in the protocol.
+
+**_Messages.scala_**
+
+Adding new models:
+
+```scala
+case class TemperatureUnit(value: String) extends AnyVal
+case class Temperature(value: Double, unit: TemperatureUnit)
+```
+
+**_SmartHomeService.scala_**
+
+And the `getTemperature` operation:
+
+```scala
+@service(Protobuf) trait SmartHomeService[F[_]] {
+
+  def isEmpty(request: IsEmptyRequest): F[IsEmptyResponse]
+
+  def getTemperature(empty: Empty.type): Stream[F, Temperature]
+}
+```
+
+### Server
+
+If we want to emit a stream of `Temperature` values,  we would be well advised to develop a producer of `Temperature` in the server side. For instance:
+
+```scala
+trait TemperatureReader[F[_]] {
+  def sendSamples: Stream[F, Temperature]
+}
+
+object TemperatureReader {
+  implicit def instance[F[_]: Sync: Logger: Timer]: TemperatureReader[F] =
+    new TemperatureReader[F] {
+      val seed = Temperature(77d, TemperatureUnit("Fahrenheit"))
+
+      def readTemperature(current: Temperature): F[Temperature] =
+        Timer[F]
+          .sleep(1.second)
+          .flatMap(_ =>
+            Sync[F].delay {
+              val increment: Double = Random.nextDouble() / 2d
+              val signal            = if (Random.nextBoolean()) 1 else -1
+              val currentValue      = current.value
+
+              current.copy(
+                value = BigDecimal(currentValue + (signal * increment))
+                  .setScale(2, RoundingMode.HALF_UP)
+                  .doubleValue)
+          })
+
+      override def sendSamples: Stream[F, Temperature] =
+        Stream.iterateEval(seed) { t =>
+          Logger[F].info(s"* New Temperature 👍  --> $t").flatMap(_ => readTemperature(t))
+        }
+    }
+
+  def apply[F[_]](implicit ev: TemperatureReader[F]): TemperatureReader[F] = ev
+}
+```
+
+And this can be returned as response of the new service, in the interpreter.
+
+```scala
+override def getTemperature(empty: Empty.type): Stream[F, Temperature] = for {
+  _            <- Stream.eval(Logger[F].info(s"$serviceName - getTemperature Request"))
+  temperatures <- TemperatureReader[F].sendSamples.take(20)
+} yield temperatures
+```
+
+### Client
+
+We have nothing less than adapt the client to consume the new service when it starting up. To this, a couple of changes are needed:
+
+Firstly we should enrich the algebra
+
+```scala
+trait SmartHomeServiceClient[F[_]] {
+
+  def isEmpty(): F[Boolean]
+
+  def getTemperature(): Stream[F, Temperature]
+
+}
+```
+
+Whose interpretation could be:
+
+```scala
+def getTemperature: Stream[F, TemperaturesSummary] = for {
+  client <- Stream.eval(clientF)
+  response <- client
+    .getTemperature(Empty)
+    .flatMap(t => Stream.eval(L.info(s"* Received new temperature: 👍  --> $t")).as(t))
+    .fold(TemperaturesSummary.empty)((summary, temperature) => summary.append(temperature))
+} yield response
+```
+
+Basically, we are logging the incoming values and at the end we calculate the average of those values.
+
+Now, the client app calls to both services: `isEmpty` and `getTemperature`.
+And finally, to call it:
+
+```scala
+for {
+  client  <- SmartHomeServiceClient.createClient(config.host.value, config.port.value)
+  _       <- Stream.eval(client.isEmpty)
+  summary <- client.getTemperature
+  _       <- Stream.eval(Logger[F].info(s"The average temperature is: ${summary.averageTemperature}"))
+} yield StreamApp.ExitCode.Success
+```
+
+### Result
+
+When we run the client now with `sbt runClient` we get:
+
+```bash
+INFO  - Created new RPC client for (localhost,19683)
+INFO  - Result: IsEmptyResponse(true)
+INFO  - * Received new temperature: 👍  --> Temperature(77.0,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.25,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.58,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(78.02,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.67,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.5,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.58,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(77.15,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.66,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.45,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.77,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.74,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.41,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.59,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.77,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.49,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.04,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(76.42,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(75.95,TemperatureUnit(Fahrenheit))
+INFO  - * Received new temperature: 👍  --> Temperature(75.97,TemperatureUnit(Fahrenheit))
+INFO  - The average temperature is: Temperature(76.85,TemperatureUnit(Fahrenheit))
+INFO  - Removed 1 RPC clients from cache.
+```
+
+And the server log the request as expected:
+
+```bash
+INFO  - ServiceName(seedServer) - Starting app.server at Host(localhost):Port(19683)
+INFO  - SmartHomeService - Request: IsEmptyRequest()
+INFO  - SmartHomeService - getTemperature Request
+INFO  - * New Temperature 👍  --> Temperature(77.0,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.25,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.58,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(78.02,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.67,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.5,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.58,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(77.15,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.66,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.45,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.77,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.74,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.41,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.59,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.77,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.49,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.04,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(76.42,TemperatureUnit(Fahrenheit))
+INFO  - * New Temperature 👍  --> Temperature(75.95,TemperatureUnit(Fahrenheit))
+```
+
+## Bidirectional streaming RPC service: `comingBackMode`
+
+To illustrate the bidirectional streaming, we are going to build a new service that makes the server react to real-time info provided by the client. In this case, as we said above, the client (the mobile app) will emit a stream of coordinates (latitude and longitude), and the server (the smart home) will trigger some actions according to the distance.
+
+### Protocol
+
+So let's add this service to the protocol.
+
+**_Messages.scala_**
+
+Adding new models:
+
+```scala
+case class Point(lat: Double, long: Double)
+case class Location(currentLocation: Point, destination: Point, distanceToDestination: Double)
+case class SmartHomeAction(description: String, isDone: Boolean)
+```
+
+**_SmartHomeService.scala_**
+
+And the `comingBackMode` operation:
+
+```scala
+@service(Protobuf) trait SmartHomeService[F[_]] {
+
+  def isEmpty(request: IsEmptyRequest): F[IsEmptyResponse]
+
+  def getTemperature(empty: Empty.type): Stream[F, Temperature]
+
+  def comingBackMode(request: Stream[F, Location]): Stream[F, ComingBackModeResponse]
+}
+```
+
+### Server
+
+So there is a new function to be implemented in the interpreter:
+
+```scala
+override def comingBackMode(request: Stream[F, Location]): Stream[F, ComingBackModeResponse] =
+  for {
+    _        <- Stream.eval(Logger[F].info(s"$serviceName - Enabling Coming Back Home mode"))
+    location <- request
+    _ <- Stream.eval(
+      if (location.distanceToDestination > 0.0d) Logger[F].info(s"$serviceName - Distance to destination: ${location.distanceToDestination} mi")
+      else Logger[F].info(s"$serviceName - You have reached your destination 🏡"))
+    response <- Stream.eval(SmartHomeSupervisor[F].performAction(location))
+  } yield response
+```
+
+### Client
+
+Again, if the client will emit a stream of locations, we should develop a producer, which as been created at `LocationGenerators`. No big deal, so far. But we have to add this operation in the `SmartHomeServiceClient`:
+
+```scala
+trait SmartHomeServiceClient[F[_]] {
+  def isEmpty(): F[Boolean]
+  def getTemperature(): Stream[F, Temperature]
+  def comingBackMode(locations: Stream[F, Location]): F[Boolean]
+}
+```
+
+Whose interpretation could be:
+
+```scala
+def comingBackMode(locations: Stream[F, Location]): Stream[F, ComingBackModeResponse] = for {
+  client   <- Stream.eval(clientF)
+  response <- client.comingBackMode(locations)
+} yield response
+```
+
+Now, we have all the ingredients to proceed in the ClientApp:
+
+```scala
+for {
+  client   <- SmartHomeServiceClient.createClient(config.host.value, config.port.value)
+  _        <- Stream.eval(client.isEmpty)
+  summary  <- client.getTemperature
+  _        <- Stream.eval(Logger[F].info(s"The average temperature is: ${summary.averageTemperature}"))
+  response <- client.comingBackMode(LocationsGenerator.get[F])
+} yield response.actions
+```
+
+### Result
+
+When we run the client now with `sbt runClient` we get:
+
+```bash
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👮 - Enable security cameras
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 💦 - Disable irrigation system
+
+INFO  - 🔌 - Send Rumba to the charging dock
+
+INFO  - 🛋 - Start heating the living room
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 🔥 - Fireplace in ambient mode
+
+INFO  - 🗞 - Get news summary
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 💧 - Increase the power of the hot water heater
+
+INFO  - 🛁 - Turn the towel heaters on
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 😎 - Low the blinds
+
+INFO  - 💡 - Turn on the lights
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👩 - Connect Alexa
+
+INFO  - 📺 - Turn on the TV
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 🔦 - Turn exterior lights on
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 👀 - Waiting for a new location...
+
+INFO  - 🚪 - Unlock doors
+
+INFO  - Removed 1 RPC clients from cache.
+```
+
+And the server log the request as expected:
+
+```bash
+INFO  - SmartHomeService - Enabling Coming Back Home mode
+INFO  - SmartHomeService - Distance to destination: 6.39 mi
+INFO  - SmartHomeService - Distance to destination: 6.26 mi
+INFO  - SmartHomeService - Distance to destination: 6.13 mi
+INFO  - SmartHomeService - Distance to destination: 6.0 mi
+INFO  - SmartHomeService - Distance to destination: 5.87 mi
+INFO  - SmartHomeService - Distance to destination: 5.74 mi
+INFO  - SmartHomeService - Distance to destination: 5.61 mi
+INFO  - SmartHomeService - Distance to destination: 5.48 mi
+INFO  - SmartHomeService - Distance to destination: 5.35 mi
+INFO  - SmartHomeService - Distance to destination: 5.22 mi
+INFO  - SmartHomeService - Distance to destination: 5.09 mi
+INFO  - SmartHomeService - Distance to destination: 4.96 mi
+INFO  - SmartHomeService - Distance to destination: 4.83 mi
+INFO  - SmartHomeService - Distance to destination: 4.7 mi
+INFO  - SmartHomeService - Distance to destination: 4.57 mi
+INFO  - SmartHomeService - Distance to destination: 4.44 mi
+INFO  - SmartHomeService - Distance to destination: 4.31 mi
+INFO  - SmartHomeService - Distance to destination: 4.18 mi
+INFO  - SmartHomeService - Distance to destination: 4.05 mi
+INFO  - SmartHomeService - Distance to destination: 3.91 mi
+INFO  - SmartHomeService - Distance to destination: 3.78 mi
+INFO  - SmartHomeService - Distance to destination: 3.65 mi
+INFO  - SmartHomeService - Distance to destination: 3.52 mi
+INFO  - SmartHomeService - Distance to destination: 3.39 mi
+INFO  - SmartHomeService - Distance to destination: 3.26 mi
+INFO  - SmartHomeService - Distance to destination: 3.13 mi
+INFO  - SmartHomeService - Distance to destination: 3.0 mi
+INFO  - SmartHomeService - Distance to destination: 2.87 mi
+INFO  - SmartHomeService - Distance to destination: 2.74 mi
+INFO  - SmartHomeService - Distance to destination: 2.61 mi
+INFO  - SmartHomeService - Distance to destination: 2.48 mi
+INFO  - SmartHomeService - Distance to destination: 2.35 mi
+INFO  - SmartHomeService - Distance to destination: 2.22 mi
+INFO  - SmartHomeService - Distance to destination: 2.09 mi
+INFO  - SmartHomeService - Distance to destination: 1.96 mi
+INFO  - SmartHomeService - Distance to destination: 1.83 mi
+INFO  - SmartHomeService - Distance to destination: 1.7 mi
+INFO  - SmartHomeService - Distance to destination: 1.57 mi
+INFO  - SmartHomeService - Distance to destination: 1.44 mi
+INFO  - SmartHomeService - Distance to destination: 1.3 mi
+INFO  - SmartHomeService - Distance to destination: 1.17 mi
+INFO  - SmartHomeService - Distance to destination: 1.04 mi
+INFO  - SmartHomeService - Distance to destination: 0.91 mi
+INFO  - SmartHomeService - Distance to destination: 0.78 mi
+INFO  - SmartHomeService - Distance to destination: 0.65 mi
+INFO  - SmartHomeService - Distance to destination: 0.52 mi
+INFO  - SmartHomeService - Distance to destination: 0.39 mi
+INFO  - SmartHomeService - Distance to destination: 0.26 mi
+INFO  - SmartHomeService - Distance to destination: 0.13 mi
+INFO  - SmartHomeService - You have reached your destination 🏡
 ```
 
 <!-- DOCTOC SKIP -->
