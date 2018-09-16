@@ -11,24 +11,22 @@ import monix.execution.Scheduler
 
 import scala.concurrent.duration._
 
-trait PeopleServiceClient[F[_]] {
+trait SmartHomeServiceClient[F[_]] {
 
-  def getPerson(name: String): F[Person]
-
+  def isEmpty: F[Boolean]
 }
 
-object PeopleServiceClient {
+object SmartHomeServiceClient {
 
-  def apply[F[_]: Effect](clientF: F[PeopleService.Client[F]])(
+  def apply[F[_]: Effect](clientF: F[SmartHomeService.Client[F]])(
       implicit L: Logger[F]
-  ): PeopleServiceClient[F] = new PeopleServiceClient[F] {
-    override def getPerson(name: String): F[Person] =
+  ): SmartHomeServiceClient[F] = new SmartHomeServiceClient[F] {
+    override def isEmpty: F[Boolean] =
       for {
         client <- clientF
-        _      <- L.info(s"Request: $name")
-        result <- client.getPerson(PeopleRequest(name))
+        result <- client.isEmpty(IsEmptyRequest())
         _      <- L.info(s"Result: $result")
-      } yield result.person
+      } yield result.result
   }
 
   def createClient[F[_]: Effect](
@@ -39,10 +37,10 @@ object PeopleServiceClient {
       removeUnusedAfter: FiniteDuration = 1.hour)(
       implicit L: Logger[F],
       TM: Timer[F],
-      S: Scheduler): fs2.Stream[F, PeopleServiceClient[F]] = {
+      S: Scheduler): fs2.Stream[F, SmartHomeServiceClient[F]] = {
 
-    def fromChannel(channel: ManagedChannel): PeopleService.Client[F] =
-      PeopleService.clientFromChannel(channel, CallOptions.DEFAULT)
+    def fromChannel(channel: ManagedChannel): SmartHomeService.Client[F] =
+      SmartHomeService.clientFromChannel(channel, CallOptions.DEFAULT)
 
     ClientRPC
       .clientCache(
@@ -51,6 +49,6 @@ object PeopleServiceClient {
         tryToRemoveUnusedEvery,
         removeUnusedAfter,
         fromChannel)
-      .map(cache => PeopleServiceClient(cache.getClient))
+      .map(cache => SmartHomeServiceClient(cache.getClient))
   }
 }
